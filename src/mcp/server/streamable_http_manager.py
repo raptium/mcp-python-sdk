@@ -55,6 +55,8 @@ class StreamableHTTPSessionManager:
         security_settings: Optional transport security settings.
         retry_interval: Retry interval in milliseconds to suggest to clients in SSE
                        retry field. Used for SSE polling behavior.
+        cleanup_interval_minutes: How often in minutes to check for and remove terminated
+                                 server instances. Default is 10 minutes.
     """
 
     def __init__(
@@ -65,6 +67,7 @@ class StreamableHTTPSessionManager:
         stateless: bool = False,
         security_settings: TransportSecuritySettings | None = None,
         retry_interval: int | None = None,
+        cleanup_interval_minutes: float = 10.0,
     ):
         self.app = app
         self.event_store = event_store
@@ -72,10 +75,13 @@ class StreamableHTTPSessionManager:
         self.stateless = stateless
         self.security_settings = security_settings
         self.retry_interval = retry_interval
+        self.cleanup_interval_minutes = cleanup_interval_minutes
 
         # Session tracking (only used if not stateless)
         self._session_creation_lock = anyio.Lock()
         self._server_instances: dict[str, StreamableHTTPServerTransport] = {}
+        # Track terminated instances to remove on next cleanup cycle
+        self._terminated_instances: set[str] = set()
 
         # The task group will be set during lifespan
         self._task_group = None
@@ -114,6 +120,14 @@ class StreamableHTTPSessionManager:
             # Store the task group for later use
             self._task_group = tg
             logger.info("StreamableHTTP session manager started")
+
+            # Start the cleanup task if not in stateless mode
+            if not self.stateless:
+                tg.start_soon(self._cleanup_terminated_instances)
+                logger.info(
+                    f"Started cleanup task, checking every {self.cleanup_interval_minutes}min"
+                )
+
             try:
                 yield  # Let the application run
             finally:
@@ -123,6 +137,7 @@ class StreamableHTTPSessionManager:
                 self._task_group = None
                 # Clear any remaining server instances
                 self._server_instances.clear()
+                self._terminated_instances.clear()
 
     async def handle_request(
         self,
@@ -295,3 +310,72 @@ class StreamableHTTPSessionManager:
                 media_type="application/json",
             )
             await response(scope, receive, send)
+
+    async def _cleanup_terminated_instances(self) -> None:
+        """Background task that periodically checks for terminated server instances.
+
+        On first check, marks terminated instances. On next check, removes them.
+        """
+        logger.debug("Cleanup task started")
+
+        while True:
+            try:
+                # Sleep for the check interval
+                await anyio.sleep(self.cleanup_interval_minutes * 60)
+
+                instances_to_remove = []
+
+                # Check all server instances for terminated ones
+                for session_id, transport in self._server_instances.items():
+                    if transport.is_terminated:
+                        if session_id in self._terminated_instances:
+                            # Already marked as terminated, remove it now
+                            instances_to_remove.append(session_id)
+                        else:
+                            # First time seeing it as terminated, mark it
+                            self._terminated_instances.add(session_id)
+                            logger.debug(
+                                f"Marked terminated session {session_id} for cleanup"
+                            )
+
+                # Remove instances that were marked in previous cycle
+                for session_id in instances_to_remove:
+                    if session_id in self._server_instances:
+                        logger.info(f"Cleaning up terminated session {session_id}")
+                        del self._server_instances[session_id]
+
+                    # Remove from terminated tracking
+                    self._terminated_instances.discard(session_id)
+
+                # Clean up any orphaned entries in terminated_instances
+                orphaned_sessions = [
+                    session_id
+                    for session_id in self._terminated_instances
+                    if session_id not in self._server_instances
+                ]
+
+                for session_id in orphaned_sessions:
+                    logger.debug(
+                        f"Removing orphaned terminated session tracking for {session_id}"
+                    )
+                    self._terminated_instances.discard(session_id)
+
+                if instances_to_remove:
+                    logger.info(
+                        f"Cleanup completed. Removed {len(instances_to_remove)} terminated sessions. "
+                        f"Active sessions: {len(self._server_instances)}, "
+                        f"Terminated sessions awaiting cleanup: {len(self._terminated_instances)}"
+                    )
+
+            except anyio.get_cancelled_exc_class():
+                logger.info("Cleanup task cancelled")
+                break
+            except Exception:
+                logger.exception("Error in cleanup task, continuing...")
+                # Continue the loop even if there's an error
+
+    def find_transport(
+        self, mcp_session_id: str
+    ) -> StreamableHTTPServerTransport | None:
+        """Look up a transport by its MCP session ID."""
+        return self._server_instances.get(mcp_session_id)
